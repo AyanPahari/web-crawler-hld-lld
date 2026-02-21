@@ -48,6 +48,7 @@ class CrawlResponse(BaseModel):
 
     # derived
     topics: list[str] = []
+    page_type: str = "other"    # product | news_article | blog_post | homepage | other
 
     # error info
     error: Optional[str] = None

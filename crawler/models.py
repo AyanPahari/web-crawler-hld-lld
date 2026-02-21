@@ -36,6 +36,7 @@ class CrawlResult:
 
     # derived
     topics: list[str] = field(default_factory=list)     # top keywords / topics ranked by TF-IDF
+    page_type: str = "other"                            # product | news_article | blog_post | homepage | other
     word_count: int = 0
 
     # error info (populated only on failure)

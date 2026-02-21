@@ -6,6 +6,7 @@ import nltk
 from nltk.corpus import stopwords
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+from .classifier import classify_page
 from .models import CrawlResult
 from .parser import parse_html
 
@@ -103,13 +104,16 @@ def _extract_topics(corpus: str, top_n: int = 15) -> list[str]:
 
 def extract_metadata(parsed: dict, url: str, final_url: str, status_code: int) -> CrawlResult:
     """
-    Combine parsed HTML signals into a CrawlResult with derived topic list.
+    Combine parsed HTML signals into a CrawlResult with derived topic list and page type.
     """
     corpus = _build_corpus(parsed)
     topics = _extract_topics(corpus)
 
     body_text = parsed.get("body_text", "")
     word_count = len(body_text.split()) if body_text else 0
+
+    # use final_url for classification — it reflects any redirects (e.g. http → https)
+    page_type = classify_page(parsed, final_url)
 
     return CrawlResult(
         url=url,
@@ -132,5 +136,6 @@ def extract_metadata(parsed: dict, url: str, final_url: str, status_code: int) -
         h2_tags=parsed.get("h2_tags", []),
         body_text=body_text[:2000] if body_text else None,  # truncate for storage
         topics=topics,
+        page_type=page_type,
         word_count=word_count,
     )

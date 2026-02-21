@@ -67,6 +67,22 @@ def test_h1_h2_in_result():
     assert "Bagel Setting" in result.h2_tags
 
 
+def test_page_type_derived_from_url():
+    # final_url contains /product/ so classifier should return "product"
+    result = extract_metadata(
+        SAMPLE_PARSED,
+        url="http://example.com/product/toaster",
+        final_url="http://example.com/product/toaster",
+        status_code=200,
+    )
+    assert result.page_type == "product"
+
+
+def test_page_type_present_in_result():
+    result = extract_metadata(SAMPLE_PARSED, url="http://example.com", final_url="http://example.com", status_code=200)
+    assert result.page_type in ("product", "news_article", "blog_post", "homepage", "other")
+
+
 def test_body_text_truncated_in_result():
     long_body = "word " * 1000
     parsed = {**SAMPLE_PARSED, "body_text": long_body}
