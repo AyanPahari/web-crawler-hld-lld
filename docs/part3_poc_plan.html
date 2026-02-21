@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Engineering Plan: Proof of Concept to Production</title>
+<style>
+  body {
+    font-family: 'Arial', sans-serif;
+    font-size: 11pt;
+    line-height: 1.6;
+    color: #202124;
+    max-width: 900px;
+    margin: 40px auto;
+    padding: 0 40px;
+    background: #fff;
+  }
+  h1 {
+    font-size: 22pt;
+    font-weight: 700;
+    color: #1a1a2e;
+    border-bottom: 2px solid #4285f4;
+    padding-bottom: 8px;
+    margin-top: 32px;
+  }
+  h2 {
+    font-size: 16pt;
+    font-weight: 600;
+    color: #1a1a2e;
+    margin-top: 28px;
+    border-left: 4px solid #4285f4;
+    padding-left: 10px;
+  }
+  h3 {
+    font-size: 13pt;
+    font-weight: 600;
+    color: #333;
+    margin-top: 20px;
+  }
+  p { margin: 10px 0; }
+  pre {
+    background: #f8f9fa;
+    border: 1px solid #dadce0;
+    border-left: 4px solid #4285f4;
+    border-radius: 4px;
+    padding: 14px 16px;
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 9pt;
+    line-height: 1.5;
+    overflow-x: auto;
+    white-space: pre;
+  }
+  code {
+    background: #f1f3f4;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 9.5pt;
+  }
+  pre code { background: none; padding: 0; font-size: 9pt; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 16px 0;
+    font-size: 10.5pt;
+  }
+  th {
+    background: #4285f4;
+    color: #fff;
+    font-weight: 600;
+    padding: 9px 14px;
+    text-align: left;
+    border: 1px solid #3367d6;
+  }
+  td {
+    padding: 8px 14px;
+    border: 1px solid #dadce0;
+    vertical-align: top;
+  }
+  tr:nth-child(even) td { background: #f8f9fa; }
+  tr:hover td { background: #e8f0fe; }
+  hr { border: none; border-top: 1px solid #dadce0; margin: 28px 0; }
+  ul, ol { margin: 8px 0; padding-left: 24px; }
+  li { margin: 4px 0; }
+  blockquote {
+    border-left: 4px solid #fbbc04;
+    margin: 16px 0;
+    padding: 8px 16px;
+    background: #fefce8;
+    color: #555;
+  }
+  @media print {
+    body { margin: 20px; padding: 0; }
+    pre { font-size: 8pt; }
+  }
+</style>
+</head>
+<body>
+<h1 id="engineering-plan-proof-of-concept-to-production">Engineering Plan: Proof of Concept to Production</h1>
+<h2 id="1-what-the-poc-needs-to-prove">1. What the POC Needs to Prove</h2>
+<p>Before committing to the full-scale architecture described in Part 2, the POC should
+answer a specific set of questions that have the most bearing on whether the system
+is feasible. These aren't questions about whether we <em>can</em> build a crawler — we
+already have one — they're questions about whether the crawler will hold up at scale
+under real-world conditions.</p>
+<p><strong>The four things the POC must validate:</strong></p>
+<ol>
+<li>
+<p><strong>Throughput target is achievable.</strong> Can we sustain ~400 URLs/second across a
+   worker pool without degrading result quality? This number sounds modest, but once
+   you account for per-domain rate limiting, robots.txt compliance, and retries, it
+   requires careful tuning.</p>
+</li>
+<li>
+<p><strong>Data quality is good enough to be useful.</strong> TF-IDF topic extraction on
+   static HTML works well for article pages (as we saw with CNN and REI). Does it
+   hold up for e-commerce pages (Amazon), single-page apps, and JS-rendered content?
+   Where does it fail?</p>
+</li>
+<li>
+<p><strong>robots.txt compliance doesn't cripple coverage.</strong> Aggressive crawl restrictions
+   from large sites like Amazon could mean a significant chunk of the URL list is
+   uncrawlable. The POC measures the actual blocked rate across a representative
+   sample and informs the re-crawl strategy.</p>
+</li>
+<li>
+<p><strong>The storage and query performance meets downstream needs.</strong> Metadata written to
+   PostgreSQL should be queryable at useful latency — a per-domain topic summary for
+   a given month should return in under 2 seconds at 10 million records.</p>
+</li>
+</ol>
+<hr />
+<h2 id="2-poc-scope-what-we-build-vs-what-we-defer">2. POC Scope: What We Build vs. What We Defer</h2>
+<p>The POC is explicitly not the full production system. It covers enough to validate
+the four questions above and no more. This boundary matters because scope creep at
+the POC stage is the most common cause of schedule slippage.</p>
+<h3 id="in-scope-for-the-poc">In scope for the POC</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>POC version</th>
+<th>Production version</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>URL ingestion</td>
+<td>Single text file, up to 10M URLs</td>
+<td>Text file + MySQL, billions of URLs</td>
+</tr>
+<tr>
+<td>Worker pool</td>
+<td>5–10 pods, fixed count</td>
+<td>10–200 pods, Kubernetes HPA</td>
+</tr>
+<tr>
+<td>Message queue</td>
+<td>Kafka, single broker</td>
+<td>Kafka, 3-node cluster</td>
+</tr>
+<tr>
+<td>Politeness</td>
+<td>robots.txt + per-domain delay</td>
+<td>Full politeness config + circuit breaker</td>
+</tr>
+<tr>
+<td>Metadata store</td>
+<td>PostgreSQL, single instance</td>
+<td>PostgreSQL, replicated + partitioned</td>
+</tr>
+<tr>
+<td>Raw HTML store</td>
+<td>S3, no lifecycle policy</td>
+<td>S3 with Glacier lifecycle</td>
+</tr>
+<tr>
+<td>Search</td>
+<td>Not included</td>
+<td>Elasticsearch</td>
+</tr>
+<tr>
+<td>Monitoring</td>
+<td>Basic Prometheus + one Grafana dashboard</td>
+<td>Full observability stack</td>
+</tr>
+<tr>
+<td>Deduplication</td>
+<td>In-memory Bloom filter (one worker)</td>
+<td>Redis-backed Bloom filter (shared)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="out-of-scope-for-the-poc">Out of scope for the POC</h3>
+<ul>
+<li>Multi-region deployment</li>
+<li>Elasticsearch analytics layer</li>
+<li>Full alerting and on-call setup</li>
+<li>Schema migration tooling</li>
+<li>Cost attribution dashboards</li>
+<li>Re-crawl scheduling logic</li>
+</ul>
+<p>The POC runs against a representative sample: 1 million URLs across 5 domains —
+amazon.com, walmart.com, bestbuy.com, cnn.com, and rei.com — crawled for one month.
+This is large enough to surface real bottlenecks without requiring full production
+infrastructure.</p>
+<hr />
+<h2 id="3-potential-blockers">3. Potential Blockers</h2>
+<p>These are risks that could derail the POC timeline or force a redesign. Each is
+classified as <strong>known</strong> (we understand the problem, the solution path is clear) or
+<strong>uncertain</strong> (we need to investigate before we can estimate the impact).</p>
+<h3 id="31-anti-bot-measures-uncertain-high-risk">3.1 Anti-Bot Measures (Uncertain — HIGH RISK)</h3>
+<p>Large e-commerce sites, particularly Amazon and Walmart, deploy sophisticated bot
+detection that goes beyond robots.txt. This includes browser fingerprinting, JavaScript
+challenges, rate limiting by ASN, and CAPTCHA triggers.</p>
+<p><strong>What this looks like:</strong> Requests return HTTP 200 but the HTML body is a CAPTCHA
+page or a minimal "access denied" shell rather than actual product content.</p>
+<p><strong>Mitigation options:</strong>
+- Rotate User-Agent strings across realistic browser signatures
+- Introduce randomized delays within the politeness window (not just fixed intervals)
+- Reduce crawl rate on domains where the empty-content rate exceeds 10%
+- Accept that some domains will have lower coverage and document it as a known
+  limitation in the POC evaluation</p>
+<p><strong>What we need to measure:</strong> What percentage of successfully fetched pages return
+actual content vs. bot-detection responses? This number drives whether we need a
+more sophisticated fetch strategy before production.</p>
+<h3 id="32-javascript-rendered-content-known-medium-risk">3.2 JavaScript-Rendered Content (Known — MEDIUM RISK)</h3>
+<p>The current crawler fetches static HTML. A growing portion of the web — especially
+product pages — renders meaningful content via JavaScript after the initial HTML load.
+Metadata like descriptions and headings may be empty or minimal in the raw HTML.</p>
+<p><strong>What this looks like:</strong> The crawler returns a <code>CrawlResult</code> with a valid 200 status
+but near-empty <code>body_text</code> and no meaningful topics, because the real content was
+injected by React or a similar framework after page load.</p>
+<p><strong>Mitigation options:</strong>
+- For the POC, classify these as "low-content pages" and flag them in the metadata
+  (<code>word_count &lt; 100</code> is a useful proxy)
+- A headless browser tier (Playwright/Puppeteer in a separate worker pool) can
+  handle JS-heavy pages in production — this is a known solved problem but adds
+  significant infrastructure complexity. Defer to post-POC unless the coverage
+  gap is unacceptable.</p>
+<p><strong>What we need to measure:</strong> What percentage of pages across our target domains have
+<code>word_count &lt; 100</code> after crawling? If it's under 15%, static crawling is sufficient
+for the majority of use cases.</p>
+<h3 id="33-kafka-partition-imbalance-known-low-risk">3.3 Kafka Partition Imbalance (Known — LOW RISK)</h3>
+<p>Partitioning Kafka by <code>hash(domain) % num_partitions</code> works well when domains are
+evenly distributed. In practice, amazon.com may have 50x more URLs than a smaller
+site, causing one partition to become a hotspot while others are idle.</p>
+<p><strong>Mitigation:</strong> Composite partition key (<code>hash(domain + url_path_prefix)</code>). This is
+a known fix, straightforward to implement, and can be done before the first load test.</p>
+<h3 id="34-postgresql-write-throughput-at-scale-known-medium-risk">3.4 PostgreSQL Write Throughput at Scale (Known — MEDIUM RISK)</h3>
+<p>At 400 URLs/second, we're writing 400 rows/second to PostgreSQL. Batch inserts of
+500 records bring this down to ~0.8 writes/second to the DB, which is well within
+PostgreSQL's capabilities on modest hardware. However, if the batch accumulation
+adds too much latency on the worker side, we may need to tune batch size or use
+COPY instead of INSERT.</p>
+<p><strong>What we need to measure:</strong> End-to-end latency from fetch completion to record
+committed in the DB. Target: under 5 seconds for p99.</p>
+<h3 id="35-schema-evolution-known-low-risk">3.5 Schema Evolution (Known — LOW RISK)</h3>
+<p>As we discover new metadata signals worth extracting (e.g., structured data /
+JSON-LD, canonical tag reliability, hreflang), we'll need to add columns. Monthly
+partitioning makes this easier — new partitions pick up the new schema, old ones
+are untouched. But we still need a migration plan before production.</p>
+<p><strong>Mitigation:</strong> Add a <code>meta_json</code> JSONB column as an overflow store. New fields are
+added here first (no migration required), promoted to proper columns only when usage
+patterns stabilize.</p>
+<hr />
+<h2 id="4-sprint-plan-and-time-estimates">4. Sprint Plan and Time Estimates</h2>
+<p>The POC runs across 6 sprints of 2 weeks each (12 weeks total). This assumes a
+team of 4 engineers with the ownership split described in Section 5.</p>
+<h3 id="sprint-1-infrastructure-baseline-weeks-12">Sprint 1 — Infrastructure Baseline (Weeks 1–2)</h3>
+<p><strong>Goal:</strong> Local dev environment works end to end for a single worker against 1,000 URLs.</p>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Owner</th>
+<th>Estimate</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Set up Kafka (single broker, Docker Compose)</td>
+<td>Infra Eng</td>
+<td>3 days</td>
+</tr>
+<tr>
+<td>Set up PostgreSQL with partitioning</td>
+<td>Backend Eng 1</td>
+<td>2 days</td>
+</tr>
+<tr>
+<td>S3 bucket setup + IAM roles</td>
+<td>Infra Eng</td>
+<td>1 day</td>
+</tr>
+<tr>
+<td>Wire crawler → Kafka consumer → DB writer</td>
+<td>Backend Eng 1</td>
+<td>3 days</td>
+</tr>
+<tr>
+<td>Basic Prometheus metrics on worker</td>
+<td>Backend Eng 2</td>
+<td>2 days</td>
+</tr>
+<tr>
+<td>URL ingestion job (text file → Kafka)</td>
+<td>Backend Eng 2</td>
+<td>2 days</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Exit criteria:</strong> Single worker processes 1,000 URLs from a test file, results appear
+in PostgreSQL, metrics visible in Prometheus.</p>
+<hr />
+<h3 id="sprint-2-politeness-and-compliance-weeks-34">Sprint 2 — Politeness and Compliance (Weeks 3–4)</h3>
+<p><strong>Goal:</strong> Full politeness layer working; robots.txt compliance verified and measured.</p>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Owner</th>
+<th>Estimate</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Politeness Controller service</td>
+<td>Backend Eng 1</td>
+<td>4 days</td>
+</tr>
+<tr>
+<td>Redis-backed robots.txt cache</td>
+<td>Backend Eng 1</td>
+<td>2 days</td>
+</tr>
+<tr>
+<td>Per-domain rate limiter (Redis token bucket)</td>
+<td>Backend Eng 2</td>
+<td>3 days</td>
+</tr>
+<tr>
+<td>Domain-override config (YAML)</td>
+<td>Backend Eng 2</td>
+<td>1 day</td>
+</tr>
+<tr>
+<td>Measure blocked rate across 5 target domains</td>
+<td>QA / Eng</td>
+<td>2 days</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Exit criteria:</strong> robots.txt compliance is 100%; domain override config works;
+blocked rate report generated for all 5 target domains.</p>
+<hr />
+<h3 id="sprint-3-scale-out-worker-pool-weeks-56">Sprint 3 — Scale-Out Worker Pool (Weeks 5–6)</h3>
+<p><strong>Goal:</strong> 5-pod worker fleet on Kubernetes, processing 10,000 URLs at sustained pace.</p>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Owner</th>
+<th>Estimate</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Kubernetes deployment manifests for workers</td>
+<td>Infra Eng</td>
+<td>3 days</td>
+</tr>
+<tr>
+<td>Shared Redis Bloom filter for dedup</td>
+<td>Backend Eng 2</td>
+<td>2 days</td>
+</tr>
+<tr>
+<td>Kafka partition rebalancing on pod scale</td>
+<td>Backend Eng 1</td>
+<td>2 days</td>
+</tr>
+<tr>
+<td>Load test: 10,000 URLs, measure throughput and error rate</td>
+<td>All</td>
+<td>2 days</td>
+</tr>
+<tr>
+<td>Tune batch insert size for DB throughput</td>
+<td>Backend Eng 1</td>
+<td>1 day</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Exit criteria:</strong> 5-pod fleet sustains 50+ URLs/second; DB write p99 &lt; 5s; no
+duplicate records in PostgreSQL (dedup working).</p>
+<hr />
+<h3 id="sprint-4-data-quality-and-topic-accuracy-weeks-78">Sprint 4 — Data Quality and Topic Accuracy (Weeks 7–8)</h3>
+<p><strong>Goal:</strong> Validate topic extraction quality across all page types; classify failures.</p>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Owner</th>
+<th>Estimate</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Crawl representative 50k URL sample (10k per domain)</td>
+<td>All</td>
+<td>2 days</td>
+</tr>
+<tr>
+<td>Audit word_count distribution — flag low-content pages</td>
+<td>QA / Eng</td>
+<td>2 days</td>
+</tr>
+<tr>
+<td>Manual review of 200 random results for topic relevance</td>
+<td>QA / Eng</td>
+<td>3 days</td>
+</tr>
+<tr>
+<td>Add meta_json JSONB column for structured data extraction</td>
+<td>Backend Eng 1</td>
+<td>2 days</td>
+</tr>
+<tr>
+<td>Document JS-rendering gap with % affected per domain</td>
+<td>QA / Eng</td>
+<td>1 day</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Exit criteria:</strong> Topic quality rated acceptable (≥ 80% relevant on manual review)
+for content-rich pages; low-content page percentage documented per domain.</p>
+<hr />
+<h3 id="sprint-5-full-poc-load-test-weeks-910">Sprint 5 — Full POC Load Test (Weeks 9–10)</h3>
+<p><strong>Goal:</strong> Process 1 million URLs, hit throughput target, confirm system stability.</p>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Owner</th>
+<th>Estimate</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ingest full 1M URL test file</td>
+<td>Backend Eng 2</td>
+<td>1 day</td>
+</tr>
+<tr>
+<td>Scale worker fleet to 10 pods</td>
+<td>Infra Eng</td>
+<td>1 day</td>
+</tr>
+<tr>
+<td>Monitor 24-hour sustained crawl</td>
+<td>All</td>
+<td>2 days</td>
+</tr>
+<tr>
+<td>Measure final metrics vs. SLO targets</td>
+<td>All</td>
+<td>2 days</td>
+</tr>
+<tr>
+<td>Grafana dashboard — crawl progress burn-down</td>
+<td>Backend Eng 2</td>
+<td>2 days</td>
+</tr>
+<tr>
+<td>PostgreSQL query performance test (per-domain topic summary)</td>
+<td>Backend Eng 1</td>
+<td>2 days</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Exit criteria:</strong> 1M URLs processed; ≥ 99% completion rate; throughput ≥ 400 URLs/sec
+at peak; DB query p99 &lt; 2 seconds for domain summary queries.</p>
+<hr />
+<h3 id="sprint-6-poc-evaluation-and-production-readiness-plan-weeks-1112">Sprint 6 — POC Evaluation and Production Readiness Plan (Weeks 11–12)</h3>
+<p><strong>Goal:</strong> Document POC results, gap analysis against production requirements, go/no-go decision.</p>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Owner</th>
+<th>Estimate</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Write POC evaluation report</td>
+<td>Tech Lead</td>
+<td>3 days</td>
+</tr>
+<tr>
+<td>Gap analysis: POC vs. production architecture</td>
+<td>Tech Lead</td>
+<td>2 days</td>
+</tr>
+<tr>
+<td>Cost projection based on POC resource usage</td>
+<td>Infra Eng</td>
+<td>2 days</td>
+</tr>
+<tr>
+<td>Production readiness checklist (see Section 7)</td>
+<td>All</td>
+<td>2 days</td>
+</tr>
+<tr>
+<td>Go/no-go decision meeting with stakeholders</td>
+<td>All</td>
+<td>1 day</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Exit criteria:</strong> Signed-off POC evaluation report; go/no-go decision made; if go,
+production sprint plan drafted.</p>
+<hr />
+<h2 id="5-team-ownership-model">5. Team Ownership Model</h2>
+<p>The service divides naturally into three areas. Each area has a clearly identified
+owner — one person who is accountable for that area working end to end, even when
+others contribute to it.</p>
+<h3 id="area-1-crawler-core-and-data-quality">Area 1: Crawler Core and Data Quality</h3>
+<p><strong>Owner: Backend Engineer 1</strong></p>
+<p>Responsible for the crawler package, topic extraction logic, metadata schema, and
+anything relating to the accuracy and completeness of crawled data. When a product
+manager asks "why are the topics wrong for Walmart product pages?", this engineer
+is the first point of contact.</p>
+<p>Day-to-day scope: <code>crawler/</code> package, PostgreSQL schema, batch write pipeline,
+topic extraction tuning, structured data parsing.</p>
+<h3 id="area-2-infrastructure-and-distributed-systems">Area 2: Infrastructure and Distributed Systems</h3>
+<p><strong>Owner: Infrastructure Engineer</strong></p>
+<p>Responsible for Kafka setup and operations, Kubernetes worker deployment, autoscaling
+configuration, S3 storage, Redis, and anything to do with the system running reliably
+at scale. When workers crash or Kafka lag spikes, this is the on-call owner.</p>
+<p>Day-to-day scope: <code>docker-compose.yml</code>, Kubernetes manifests, Kafka topics and
+partitioning, S3 lifecycle policies, scaling policies, incident response runbook.</p>
+<h3 id="area-3-api-observability-and-developer-experience">Area 3: API, Observability, and Developer Experience</h3>
+<p><strong>Owner: Backend Engineer 2</strong></p>
+<p>Responsible for the FastAPI service, caching layer, rate limiting, the politeness
+controller, Prometheus metrics, and Grafana dashboards. Also owns the URL ingestion
+pipeline (text file and MySQL reader). When the API is slow or the Grafana dashboard
+shows something wrong, this is the owner.</p>
+<p>Day-to-day scope: <code>api/</code> package, politeness controller, Redis integration,
+monitoring stack, ingestion jobs.</p>
+<h3 id="tech-lead-qa">Tech Lead / QA</h3>
+<p>Floats across all three areas. Responsible for the overall sprint plan, cross-area
+design decisions, the load test process, the POC evaluation report, and escalation
+to stakeholders. In a small team, this role likely overlaps with one of the engineers
+above — it's a hat, not necessarily a dedicated headcount.</p>
+<hr />
+<h2 id="6-resource-and-time-estimates">6. Resource and Time Estimates</h2>
+<h3 id="team">Team</h3>
+<table>
+<thead>
+<tr>
+<th>Role</th>
+<th>Count</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Backend Engineer</td>
+<td>2</td>
+<td>Core crawler, API, ingestion</td>
+</tr>
+<tr>
+<td>Infrastructure Engineer</td>
+<td>1</td>
+<td>Kafka, Kubernetes, S3</td>
+</tr>
+<tr>
+<td>Tech Lead / QA</td>
+<td>1</td>
+<td>Can be a senior backend eng wearing both hats</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Total: 4 engineers</strong> for the 12-week POC. This is lean — it works if scope is held
+strictly to the POC boundary defined in Section 2.</p>
+<h3 id="timeline">Timeline</h3>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Duration</th>
+<th>Milestone</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sprints 1–2</td>
+<td>Weeks 1–4</td>
+<td>End-to-end pipeline working locally, compliance verified</td>
+</tr>
+<tr>
+<td>Sprints 3–4</td>
+<td>Weeks 5–8</td>
+<td>Scale-out working, data quality validated</td>
+</tr>
+<tr>
+<td>Sprint 5</td>
+<td>Weeks 9–10</td>
+<td>Full 1M URL load test complete</td>
+</tr>
+<tr>
+<td>Sprint 6</td>
+<td>Weeks 11–12</td>
+<td>POC evaluation and go/no-go</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Total POC duration: 12 weeks.</strong> Post-POC production hardening (Elasticsearch,
+full alerting, multi-region, re-crawl scheduling) is an estimated additional
+8–10 sprints (16–20 weeks) with a team of 5–6 engineers.</p>
+<h3 id="infrastructure-costs-poc-estimated">Infrastructure Costs (POC, estimated)</h3>
+<table>
+<thead>
+<tr>
+<th>Resource</th>
+<th>Size</th>
+<th>Monthly Cost (est.)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Kubernetes worker nodes (10 pods)</td>
+<td>2 vCPU / 4GB each, spot</td>
+<td>~$150–$200</td>
+</tr>
+<tr>
+<td>Kafka broker</td>
+<td>4 vCPU / 8GB</td>
+<td>~$100</td>
+</tr>
+<tr>
+<td>PostgreSQL (RDS)</td>
+<td>db.t3.large</td>
+<td>~$120</td>
+</tr>
+<tr>
+<td>Redis (ElastiCache)</td>
+<td>cache.t3.small</td>
+<td>~$25</td>
+</tr>
+<tr>
+<td>S3 storage (1M URLs × 50KB gzipped)</td>
+<td>~50 GB</td>
+<td>~$1.15</td>
+</tr>
+<tr>
+<td>Data transfer</td>
+<td>Variable</td>
+<td>~$20–$50</td>
+</tr>
+<tr>
+<td><strong>Total POC</strong></td>
+<td></td>
+<td><strong>~$420–$500/month</strong></td>
+</tr>
+</tbody>
+</table>
+<p>At full production scale (1B URLs/month), infrastructure cost grows to an estimated
+$15,000–$25,000/month before spot-instance discounts, rising to S3 storage
+dominating at ~$1,500–$2,000/month for raw HTML.</p>
+<hr />
+<h2 id="7-poc-evaluation-criteria">7. POC Evaluation Criteria</h2>
+<p>At the end of Sprint 6, the POC is evaluated against these criteria. A "go" decision
+requires all four primary criteria to pass. Secondary criteria inform production
+prioritization but don't block the decision.</p>
+<h3 id="primary-must-pass-for-go-decision">Primary (must pass for go decision)</h3>
+<table>
+<thead>
+<tr>
+<th>Criterion</th>
+<th>Target</th>
+<th>How measured</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Throughput</td>
+<td>≥ 400 URLs/sec sustained over 1 hour</td>
+<td>Prometheus <code>crawler_urls_processed_total</code> rate</td>
+</tr>
+<tr>
+<td>Completion rate</td>
+<td>≥ 99% of submitted URLs processed</td>
+<td>(done / total) from ingestion job</td>
+</tr>
+<tr>
+<td>Topic quality</td>
+<td>≥ 80% relevant on 200-item manual review</td>
+<td>QA scorecard</td>
+</tr>
+<tr>
+<td>DB query performance</td>
+<td>Domain summary query p99 &lt; 2 seconds</td>
+<td>pgBench test at 10M rows</td>
+</tr>
+</tbody>
+</table>
+<h3 id="secondary-inform-production-roadmap">Secondary (inform production roadmap)</h3>
+<table>
+<thead>
+<tr>
+<th>Criterion</th>
+<th>Acceptable range</th>
+<th>Action if outside range</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>JS-rendered page rate</td>
+<td>&lt; 20% low-content pages</td>
+<td>Prioritize headless browser tier in post-POC</td>
+</tr>
+<tr>
+<td>Bot-blocked rate</td>
+<td>&lt; 15% of URLs</td>
+<td>Investigate fetch strategy upgrades</td>
+</tr>
+<tr>
+<td>DB write latency p99</td>
+<td>&lt; 5 seconds</td>
+<td>Tune batch size or switch to COPY</td>
+</tr>
+<tr>
+<td>S3 write failure rate</td>
+<td>&lt; 0.5%</td>
+<td>Check IAM permissions, retry logic</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="8-release-plan">8. Release Plan</h2>
+<p>The release plan covers the path from the current POC state to a production system
+serving real users. It has three stages.</p>
+<h3 id="stage-1-internal-beta-weeks-1316-post-poc">Stage 1: Internal Beta (Weeks 13–16, post-POC)</h3>
+<p><strong>Who:</strong> Internal users only (engineers, data analysts within the company)
+<strong>What:</strong> The API endpoint is deployed to a staging environment. Internal teams can
+submit URL lists of up to 100,000 URLs and query results.</p>
+<ul>
+<li>Full observability stack deployed (Prometheus, Grafana, Alertmanager)</li>
+<li>Runbook written for the three most likely failure modes (worker crash, Kafka lag,
+  DB write failures)</li>
+<li>Daily crawl of a fixed 100k URL benchmark set; results compared day-over-day to
+  catch regressions</li>
+<li>Bug bash: internal users report issues; all P1/P2 bugs fixed before Stage 2</li>
+</ul>
+<p><strong>Exit criteria:</strong> No P1 bugs in 7 days; 3 consecutive days of green SLO metrics.</p>
+<h3 id="stage-2-limited-external-access-weeks-1722-post-poc">Stage 2: Limited External Access (Weeks 17–22, post-POC)</h3>
+<p><strong>Who:</strong> 2–3 pilot customers with known, bounded URL sets
+<strong>What:</strong> The service handles real customer URL lists under SLA. Feedback loop is
+tight — customer issues are triaged within 24 hours.</p>
+<ul>
+<li>Elasticsearch tier enabled (search and analytics for pilot customers)</li>
+<li>Re-crawl scheduling logic deployed (freshness-based priority queue)</li>
+<li>On-call rotation established (4-engineer rotation, PagerDuty)</li>
+<li>SLA formally signed with pilot customers (based on the SLOs from Part 2)</li>
+<li>Cost attribution per customer tracked from day one</li>
+</ul>
+<p><strong>Exit criteria:</strong> Pilot customers satisfied (NPS ≥ 7/10); all SLA commitments met
+for 30 consecutive days; on-call runbook validated through at least one real incident.</p>
+<h3 id="stage-3-general-availability-week-23-post-poc">Stage 3: General Availability (Week 23+, post-POC)</h3>
+<p><strong>Who:</strong> All customers
+<strong>What:</strong> Full production service, multi-region, auto-scaled to handle variable load.</p>
+<ul>
+<li>Multi-region deployment (active-passive initially, active-active after 90 days of
+  stability data)</li>
+<li>Full documentation published: API reference, rate limits, SLAs, data schema</li>
+<li>Billing and usage tracking integrated</li>
+<li>Quarterly data retention review scheduled</li>
+</ul>
+<p><strong>Rollback plan:</strong> Each stage has a defined rollback trigger. For Stage 3, if the
+error rate exceeds 5% for more than 10 minutes after a new deployment, the system
+automatically reverts to the previous version via a Kubernetes rollout undo. A manual
+rollback can be triggered by any on-call engineer using a single command.</p>
+<hr />
+<h2 id="9-definition-of-a-successful-release">9. Definition of a Successful Release</h2>
+<p>A release is successful if, 30 days after going live:</p>
+<ol>
+<li>The monthly crawl job completes within the committed window</li>
+<li>No customer has experienced an SLA breach</li>
+<li>The on-call team has not been paged more than twice for the same root cause
+   (i.e., repeat incidents are fixed, not just mitigated)</li>
+<li>Topic quality scores from random sampling remain at or above the POC baseline</li>
+<li>The system has processed at least one full month's URL set for at least one
+   production customer</li>
+</ol>
+<p>A release is <strong>not</strong> a success if the team is still manually intervening in the
+pipeline more than once a week. Operational maturity — not just technical functionality
+— is the bar.</p>
+</body>
+</html>
