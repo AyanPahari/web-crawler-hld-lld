@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Scale Design: Operationalizing a Crawler for Billions of URLs</title>
+<style>
+  body {
+    font-family: 'Arial', sans-serif;
+    font-size: 11pt;
+    line-height: 1.6;
+    color: #202124;
+    max-width: 900px;
+    margin: 40px auto;
+    padding: 0 40px;
+    background: #fff;
+  }
+
+  h1 {
+    font-size: 22pt;
+    font-weight: 700;
+    color: #1a1a2e;
+    border-bottom: 2px solid #4285f4;
+    padding-bottom: 8px;
+    margin-top: 32px;
+  }
+
+  h2 {
+    font-size: 16pt;
+    font-weight: 600;
+    color: #1a1a2e;
+    margin-top: 28px;
+    border-left: 4px solid #4285f4;
+    padding-left: 10px;
+  }
+
+  h3 {
+    font-size: 13pt;
+    font-weight: 600;
+    color: #333;
+    margin-top: 20px;
+  }
+
+  p {
+    margin: 10px 0;
+  }
+
+  /* Code blocks — architecture diagrams */
+  pre {
+    background: #f8f9fa;
+    border: 1px solid #dadce0;
+    border-left: 4px solid #4285f4;
+    border-radius: 4px;
+    padding: 14px 16px;
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 9pt;
+    line-height: 1.5;
+    overflow-x: auto;
+    white-space: pre;
+  }
+
+  code {
+    background: #f1f3f4;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 9.5pt;
+  }
+
+  pre code {
+    background: none;
+    padding: 0;
+    font-size: 9pt;
+  }
+
+  /* Tables */
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 16px 0;
+    font-size: 10.5pt;
+  }
+
+  th {
+    background: #4285f4;
+    color: #fff;
+    font-weight: 600;
+    padding: 9px 14px;
+    text-align: left;
+    border: 1px solid #3367d6;
+  }
+
+  td {
+    padding: 8px 14px;
+    border: 1px solid #dadce0;
+    vertical-align: top;
+  }
+
+  tr:nth-child(even) td {
+    background: #f8f9fa;
+  }
+
+  tr:hover td {
+    background: #e8f0fe;
+  }
+
+  /* Horizontal rules as section breaks */
+  hr {
+    border: none;
+    border-top: 1px solid #dadce0;
+    margin: 28px 0;
+  }
+
+  ul, ol {
+    margin: 8px 0;
+    padding-left: 24px;
+  }
+
+  li {
+    margin: 4px 0;
+  }
+
+  blockquote {
+    border-left: 4px solid #fbbc04;
+    margin: 16px 0;
+    padding: 8px 16px;
+    background: #fefce8;
+    color: #555;
+  }
+
+  /* Page break hint for printing */
+  h2 {
+    page-break-before: auto;
+  }
+
+  @media print {
+    body { margin: 20px; padding: 0; }
+    pre { font-size: 8pt; }
+  }
+</style>
+</head>
+<body>
+<h1 id="scale-design-operationalizing-a-crawler-for-billions-of-urls">Scale Design: Operationalizing a Crawler for Billions of URLs</h1>
+<h2 id="overview">Overview</h2>
+<p>The core crawler built in Part 1 works well for a single URL. Scaling it to process
+billions of URLs — spread across domains like amazon.com, walmart.com, and bestbuy.com
+for a given month — requires rethinking every layer: how URLs are ingested, how work
+is distributed across machines, how fetched content is stored, and how the system
+behaves when things go wrong.</p>
+<p>This document covers the end-to-end architecture for running this at scale, along with
+the storage schema, politeness strategy, SLOs, and monitoring approach.</p>
+<hr />
+<h2 id="1-high-level-architecture">1. High-Level Architecture</h2>
+<pre><code>┌─────────────────────────────────────────────────────────────────────────────┐
+│                            URL INGESTION LAYER                              │
+│                                                                             │
+│  Text file / MySQL  ──►  URL Normalizer  ──►  Dedup Filter  ──►  Kafka     │
+│  (billions of URLs)       (canonicalize)       (Bloom filter)    Topic:    │
+│                                                                  url_queue  │
+└────────────────────────────────┬────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           SCHEDULER / POLITENESS LAYER                      │
+│                                                                             │
+│  Politeness Controller                                                      │
+│  - Reads robots.txt per domain (cached 24h in Redis)                       │
+│  - Enforces per-domain crawl delay                                         │
+│  - Groups URLs by domain, respects Crawl-Delay directive                   │
+│  - Emits to per-domain partitioned Kafka topics                            │
+└────────────────────────────────┬────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              CRAWLER WORKERS                                │
+│                                                                             │
+│  Worker Pool (auto-scaled on Kubernetes)                                   │
+│  Each worker:                                                              │
+│  1. Polls its assigned domain partition                                    │
+│  2. Fetches HTML (connection pool, retry with backoff)                     │
+│  3. Parses metadata + extracts topics (TF-IDF)                             │
+│  4. Writes result to Storage Layer                                         │
+│  5. Emits metrics + commits Kafka offset                                   │
+└────────────────────────────────┬────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              STORAGE LAYER                                  │
+│                                                                             │
+│  ┌──────────────────┐   ┌──────────────────┐   ┌────────────────────────┐  │
+│  │  PostgreSQL       │   │  S3 / GCS Bucket │   │  Elasticsearch         │  │
+│  │  (metadata store) │   │  (raw HTML store)│   │  (search + analytics)  │  │
+│  │  Partitioned by   │   │  Key: domain/    │   │  Index: crawl_metadata  │  │
+│  │  year_month       │   │  year_month/hash │   │                        │  │
+│  └──────────────────┘   └──────────────────┘   └────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<hr />
+<h2 id="2-url-ingestion">2. URL Ingestion</h2>
+<h3 id="input-sources">Input Sources</h3>
+<p>The system accepts URLs from two sources as described in the requirements:</p>
+<p><strong>Text file (batch)</strong>
+Large <code>.txt</code> files (one URL per line) are uploaded to S3/GCS. An ingestion job reads
+them in chunks of 100k, normalizes each URL, checks it against a Bloom filter, and
+publishes valid candidates to Kafka. This job runs as a Kubernetes batch Job.</p>
+<p><strong>MySQL (scheduled)</strong>
+For month-based crawl jobs (e.g., "all amazon.com URLs for July"), a cron-triggered
+job queries the MySQL table, applies the same normalization + dedup, and streams
+records to Kafka. The query is paginated using keyset pagination (not OFFSET) to
+avoid performance degradation at scale.</p>
+<pre><code class="language-sql">-- example MySQL source table
+CREATE TABLE url_queue (
+    id          BIGINT PRIMARY KEY AUTO_INCREMENT,
+    url         VARCHAR(2048) NOT NULL,
+    domain      VARCHAR(255)  NOT NULL,
+    year_month  CHAR(7)       NOT NULL,  -- e.g. '2024-07'
+    status      ENUM('pending','processing','done','failed') DEFAULT 'pending',
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_domain_month (domain, year_month),
+    INDEX idx_status (status)
+);
+</code></pre>
+<h3 id="url-normalization">URL Normalization</h3>
+<p>Before anything is queued, URLs go through a normalization step:
+- Lowercase scheme and host
+- Remove tracking parameters (<code>utm_*</code>, <code>ref</code>, <code>fbclid</code>, etc.)
+- Strip trailing slashes consistently
+- Resolve relative paths
+- Canonicalize to HTTPS where available</p>
+<h3 id="deduplication">Deduplication</h3>
+<p>A domain-partitioned Bloom filter running in Redis provides fast O(1) dedup.
+False positive rate is tuned to ~0.1% — acceptable given the scale. URLs that
+pass the Bloom filter are also checked against a "recently crawled" index (URLs
+crawled within the last N days are skipped unless a re-crawl is explicitly requested).</p>
+<hr />
+<h2 id="3-kafka-topic-design">3. Kafka Topic Design</h2>
+<pre><code>Topics:
+  url_ingest          — raw URLs from ingestion jobs (all domains, high throughput)
+  url_scheduled       — politeness-controlled, per-domain partitioned
+  crawl_results       — completed crawl results for downstream consumers
+  crawl_failures      — failed URLs for retry or dead-letter handling
+  robots_cache_miss   — domains whose robots.txt needs refreshing
+</code></pre>
+<p><strong>Partitioning strategy for <code>url_scheduled</code>:</strong> partition by <code>hash(domain) % num_partitions</code>.
+This ensures all URLs for a given domain are processed by the same worker, making
+per-domain rate limiting trivial — no cross-worker coordination needed.</p>
+<p><strong>Retention:</strong> <code>url_ingest</code> and <code>url_scheduled</code> use 7-day retention. <code>crawl_results</code>
+is retained for 30 days to allow downstream consumers to replay if needed.</p>
+<hr />
+<h2 id="4-politeness-and-robotstxt-compliance">4. Politeness and robots.txt Compliance</h2>
+<p>Respecting crawl etiquette is not optional — aggressive crawling can get the service
+IP-blocked, trigger legal issues, and damage the reputation of the crawl infrastructure.</p>
+<h3 id="robotstxt-handling">robots.txt Handling</h3>
+<ul>
+<li>On first encounter with a domain, the Politeness Controller fetches <code>/robots.txt</code>
+  and caches the parsed result in Redis with a 24-hour TTL.</li>
+<li>The crawler checks <code>can_fetch(our_user_agent, url)</code> before every request.</li>
+<li>Disallowed URLs are moved to the <code>crawl_failures</code> topic with reason <code>robots_disallowed</code>
+  rather than silently dropped, so they can be reported.</li>
+<li>If a <code>Crawl-Delay</code> directive is present, it's respected as a floor delay between
+  requests to that domain.</li>
+</ul>
+<h3 id="per-domain-rate-limiting">Per-Domain Rate Limiting</h3>
+<p>Even for domains that don't specify a crawl delay, we apply a configurable default
+minimum gap between requests to the same domain. This is enforced at the worker level
+using a per-domain Redis key with an expiry equal to the desired delay.</p>
+<pre><code>Default delays:
+  General sites:    1 request / 2 seconds
+  E-commerce sites: 1 request / 5 seconds  (higher load, stricter bots)
+  News sites:       1 request / 3 seconds
+</code></pre>
+<p>These are configurable per domain in a YAML config file, allowing operators to tune
+without redeploying workers.</p>
+<h3 id="retry-and-backoff">Retry and Backoff</h3>
+<ul>
+<li>HTTP 429 or 503: exponential backoff starting at 30s, max 3 retries.</li>
+<li>HTTP 5xx: retry up to 2 times with a 10s delay.</li>
+<li>Connection timeout: retry once after 15s, then move to dead-letter.</li>
+<li>HTTP 4xx (except 429): no retry — URL is marked <code>failed</code> with the status code.</li>
+</ul>
+<hr />
+<h2 id="5-storage-design">5. Storage Design</h2>
+<h3 id="51-postgresql-metadata-store">5.1 PostgreSQL — Metadata Store</h3>
+<p>The primary structured store for crawl results. Partitioned by <code>year_month</code> to keep
+query performance predictable as the dataset grows.</p>
+<pre><code class="language-sql">-- main metadata table, partitioned by year_month
+CREATE TABLE crawl_metadata (
+    id              BIGSERIAL,
+    url             TEXT        NOT NULL,
+    url_hash        CHAR(16)    NOT NULL,   -- sha256 prefix for fast lookup
+    domain          VARCHAR(255) NOT NULL,
+    final_url       TEXT,
+    status_code     SMALLINT    NOT NULL,
+    crawled_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    year_month      CHAR(7)     NOT NULL,   -- '2024-07'
+
+    -- standard metadata
+    title           TEXT,
+    description     TEXT,
+    keywords        TEXT,
+    author          VARCHAR(512),
+    language        CHAR(10),
+    canonical_url   TEXT,
+
+    -- open graph
+    og_title        TEXT,
+    og_description  TEXT,
+    og_image        TEXT,
+    og_type         VARCHAR(64),
+
+    -- derived
+    topics          TEXT[],                 -- top 15 TF-IDF terms
+    word_count      INTEGER DEFAULT 0,
+
+    -- storage reference
+    raw_html_path   TEXT,                   -- S3/GCS path to raw HTML
+
+    -- error tracking
+    error_message   TEXT,
+    retry_count     SMALLINT DEFAULT 0,
+
+    PRIMARY KEY (id, year_month)
+) PARTITION BY LIST (year_month);
+
+-- partition per month created automatically by the ingestion job
+CREATE TABLE crawl_metadata_2024_07 PARTITION OF crawl_metadata
+    FOR VALUES IN ('2024-07');
+
+-- indexes on the partition (applied to all partitions via the parent)
+CREATE INDEX ON crawl_metadata (url_hash, year_month);
+CREATE INDEX ON crawl_metadata (domain, crawled_at);
+CREATE INDEX ON crawl_metadata USING GIN (topics);
+</code></pre>
+<p><strong>Why partitioning?</strong> Each monthly partition is independent. Old partitions can be
+archived, dropped, or moved to cheaper storage without touching live data. Queries
+scoped to a month (<code>WHERE year_month = '2024-07'</code>) hit only one partition.</p>
+<p><strong>Why <code>url_hash</code> instead of indexing the full URL?</strong> URLs can be several hundred
+characters. A 16-char hash prefix gives fast equality lookups at a fraction of the
+index size. Collisions are practically impossible at this prefix length.</p>
+<h3 id="52-s3-gcs-raw-html-store">5.2 S3 / GCS — Raw HTML Store</h3>
+<p>Parsed metadata is cheap to re-extract, but raw HTML is not cheap to re-fetch.
+The full HTML of every crawled page is stored in object storage for reprocessing.</p>
+<pre><code>Key structure: s3://crawler-html/{domain}/{year_month}/{url_hash}.html.gz
+
+Example:
+  s3://crawler-html/amazon.com/2024-07/a3f2b1c4d5e6f7a8.html.gz
+</code></pre>
+<p>Files are gzip-compressed (typically 5-15x reduction for HTML). A lifecycle policy
+moves objects to Glacier / coldline storage after 90 days.</p>
+<h3 id="53-elasticsearch-search-and-analytics">5.3 Elasticsearch — Search and Analytics</h3>
+<p>A copy of the metadata (without raw HTML) is written to Elasticsearch for:
+- Full-text search across titles, descriptions, and topics
+- Aggregations (e.g., "top topics across walmart.com in July 2024")
+- Near-realtime querying by downstream consumers</p>
+<p>The Kafka <code>crawl_results</code> topic feeds a Kafka Connect sink that streams records
+into Elasticsearch asynchronously. The ES index is not the source of truth — that
+remains PostgreSQL.</p>
+<hr />
+<h2 id="6-configurability">6. Configurability</h2>
+<p>The crawler is designed to be config-driven rather than code-driven for operational
+parameters. A YAML config file (one per environment) controls the key knobs:</p>
+<pre><code class="language-yaml">crawl:
+  default_crawl_delay_seconds: 2
+  max_retries: 3
+  fetch_timeout_seconds: 15
+  max_content_bytes: 5242880     # 5 MB
+  user_agent: &quot;BrightEdgeCrawler/1.0 (+https://brightedge.com/crawler)&quot;
+
+politeness:
+  robots_cache_ttl_hours: 24
+  domain_overrides:
+    amazon.com:
+      crawl_delay_seconds: 5
+    walmart.com:
+      crawl_delay_seconds: 5
+
+workers:
+  concurrency_per_pod: 50        # async fetch slots per worker pod
+  pod_count_min: 10
+  pod_count_max: 200             # HPA upper bound
+
+storage:
+  metadata_db_url: &quot;${METADATA_DB_URL}&quot;
+  html_bucket: &quot;crawler-html&quot;
+  html_bucket_region: &quot;us-east-1&quot;
+  cache_url: &quot;${REDIS_URL}&quot;
+  cache_ttl_seconds: 3600
+
+topics:
+  top_n: 15
+  ngram_range: [1, 2]
+</code></pre>
+<p>Workers pick up config at startup. For domain override changes, a SIGHUP causes the
+worker to reload config without restarting, so delay changes take effect within seconds.</p>
+<hr />
+<h2 id="7-reliability-and-fault-tolerance">7. Reliability and Fault Tolerance</h2>
+<h3 id="worker-crashes">Worker Crashes</h3>
+<p>Workers commit Kafka offsets only after successfully writing to the storage layer.
+If a worker dies mid-processing, the uncommitted messages are re-delivered to another
+worker. Exactly-once semantics are approximated via the <code>url_hash + year_month</code>
+unique constraint in PostgreSQL — duplicate writes are idempotent (INSERT ON CONFLICT
+DO UPDATE).</p>
+<h3 id="storage-failures">Storage Failures</h3>
+<p>If the metadata DB is unavailable, the worker stops committing offsets and pauses
+consumption. Kafka retains messages for 7 days, giving plenty of time to recover
+without losing work.</p>
+<p>If S3 writes fail, the metadata record is still written to PostgreSQL with
+<code>raw_html_path = NULL</code>. A background reconciliation job periodically finds these
+records and re-uploads HTML from a local worker cache (if still available).</p>
+<h3 id="cascading-failures">Cascading Failures</h3>
+<p>A circuit breaker per domain prevents one slow domain from blocking workers.
+If a domain's fetch error rate exceeds 50% over a 5-minute window, that domain is
+temporarily suspended and its remaining queue is paused. An alert fires for operator
+review.</p>
+<hr />
+<h2 id="8-throughput-and-capacity-estimates">8. Throughput and Capacity Estimates</h2>
+<p>For reference at the design scale of ~1 billion URLs per month:</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>URLs per month</td>
+<td>1,000,000,000</td>
+</tr>
+<tr>
+<td>Seconds in a month</td>
+<td>~2,592,000</td>
+</tr>
+<tr>
+<td>Required sustained throughput</td>
+<td>~386 URLs/second</td>
+</tr>
+<tr>
+<td>Average fetch time (p50)</td>
+<td>1.5 seconds</td>
+</tr>
+<tr>
+<td>Workers needed at 50 concurrent fetches/pod</td>
+<td>~12 pods</td>
+</tr>
+<tr>
+<td>Workers with 2x headroom</td>
+<td>~25 pods</td>
+</tr>
+<tr>
+<td>Storage for metadata (avg 2KB/record)</td>
+<td>~2 TB/month</td>
+</tr>
+<tr>
+<td>Storage for raw HTML at 50KB avg (gzipped)</td>
+<td>~50 TB/month</td>
+</tr>
+</tbody>
+</table>
+<p>25 worker pods is well within Kubernetes autoscaling range. S3 costs at 50 TB/month
+are manageable with lifecycle policies (Glacier after 90 days drops cost ~75%).</p>
+<hr />
+<h2 id="9-slos-and-slas">9. SLOs and SLAs</h2>
+<p>These targets apply to a production deployment processing the full monthly URL set.</p>
+<h3 id="slos-internal-targets">SLOs (internal targets)</h3>
+<table>
+<thead>
+<tr>
+<th>Objective</th>
+<th>Target</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Crawl completion rate</td>
+<td>≥ 99% of submitted URLs processed within the crawl window</td>
+</tr>
+<tr>
+<td>Metadata write success rate</td>
+<td>≥ 99.5% of fetched pages produce a stored record</td>
+</tr>
+<tr>
+<td>API availability (<code>/crawl</code> endpoint)</td>
+<td>≥ 99.9% over 30-day rolling window</td>
+</tr>
+<tr>
+<td>API p99 latency (per-URL crawl)</td>
+<td>≤ 10 seconds</td>
+</tr>
+<tr>
+<td>API p50 latency</td>
+<td>≤ 2 seconds</td>
+</tr>
+<tr>
+<td>Cache hit ratio</td>
+<td>≥ 40% for repeated URL queries</td>
+</tr>
+<tr>
+<td>robots.txt compliance</td>
+<td>100% — zero violations</td>
+</tr>
+<tr>
+<td>Deduplication accuracy</td>
+<td>≥ 99.9% (Bloom filter false positive rate ≤ 0.1%)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="slas-external-commitments-to-consumers">SLAs (external commitments to consumers)</h3>
+<table>
+<thead>
+<tr>
+<th>Commitment</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Monthly crawl job completion</td>
+<td>Within 30 days of job submission</td>
+</tr>
+<tr>
+<td>Data freshness for a given URL</td>
+<td>Metadata available within 24h of successful fetch</td>
+</tr>
+<tr>
+<td>API uptime</td>
+<td>99.9% monthly</td>
+</tr>
+<tr>
+<td>Data retention</td>
+<td>Metadata retained for 18 months; raw HTML for 12 months</td>
+</tr>
+<tr>
+<td>Incident response</td>
+<td>P1 (data pipeline down) within 1 hour; P2 within 4 hours</td>
+</tr>
+</tbody>
+</table>
+<h3 id="error-budget">Error Budget</h3>
+<p>At 99.9% availability, the monthly error budget is ~43 minutes of downtime.
+Anything beyond that triggers a post-mortem and freeze on non-critical deployments.</p>
+<hr />
+<h2 id="10-monitoring-metrics-and-tooling">10. Monitoring Metrics and Tooling</h2>
+<h3 id="tooling-stack">Tooling Stack</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Tool</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Metrics collection</td>
+<td>Prometheus</td>
+</tr>
+<tr>
+<td>Dashboards</td>
+<td>Grafana</td>
+</tr>
+<tr>
+<td>Alerting</td>
+<td>Alertmanager → PagerDuty</td>
+</tr>
+<tr>
+<td>Distributed tracing</td>
+<td>Jaeger (sampled at 5%)</td>
+</tr>
+<tr>
+<td>Log aggregation</td>
+<td>ELK stack (Elasticsearch + Logstash + Kibana)</td>
+</tr>
+<tr>
+<td>Synthetic monitoring</td>
+<td>Scheduled probe jobs against the <code>/crawl</code> API</td>
+</tr>
+</tbody>
+</table>
+<h3 id="key-metrics">Key Metrics</h3>
+<p><strong>Throughput and Progress</strong>
+- <code>crawler_urls_processed_total</code> — counter, labeled by <code>domain</code> and <code>status</code> (success/failed/skipped)
+- <code>crawler_urls_queued_total</code> — size of the Kafka <code>url_scheduled</code> topic lag
+- <code>crawler_crawl_duration_seconds</code> — histogram of end-to-end crawl time per URL
+- <code>crawler_monthly_completion_percent</code> — gauge: URLs done / URLs total for current month</p>
+<p><strong>Fetch Quality</strong>
+- <code>crawler_http_response_total</code> — counter labeled by <code>status_code</code> and <code>domain</code>
+- <code>crawler_robots_blocked_total</code> — counter of URLs blocked by robots.txt
+- <code>crawler_retries_total</code> — counter labeled by retry reason
+- <code>crawler_fetch_timeout_total</code> — counter of timed-out fetches</p>
+<p><strong>Storage</strong>
+- <code>crawler_db_write_duration_seconds</code> — histogram of PostgreSQL insert latency
+- <code>crawler_s3_write_duration_seconds</code> — histogram of S3 put latency
+- <code>crawler_cache_hit_ratio</code> — gauge: cache hits / total API requests
+- <code>crawler_db_partition_row_count</code> — gauge per <code>year_month</code> partition</p>
+<p><strong>Worker Health</strong>
+- <code>crawler_worker_active_fetches</code> — gauge per pod
+- <code>crawler_worker_error_rate</code> — rate of exceptions per pod
+- <code>kafka_consumer_lag</code> — standard Kafka metric via JMX exporter</p>
+<h3 id="grafana-dashboard-panels">Grafana Dashboard Panels</h3>
+<ol>
+<li><strong>Crawl Progress</strong> — URLs processed vs. total target (monthly burn-down chart)</li>
+<li><strong>Throughput</strong> — URLs/second over time, broken down by domain</li>
+<li><strong>HTTP Status Codes</strong> — stacked bar of 200/4xx/5xx/timeout over time</li>
+<li><strong>Domain Health</strong> — table of top 20 domains with success rate and current delay</li>
+<li><strong>Worker Fleet</strong> — active workers, CPU/memory, active fetch slots per pod</li>
+<li><strong>Queue Depth</strong> — Kafka consumer lag across partitions</li>
+<li><strong>Storage Latency</strong> — DB + S3 write p50/p99 over time</li>
+<li><strong>Error Breakdown</strong> — robots blocks, timeouts, retries, parse failures</li>
+</ol>
+<h3 id="alerts">Alerts</h3>
+<table>
+<thead>
+<tr>
+<th>Alert</th>
+<th>Condition</th>
+<th>Severity</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pipeline stalled</td>
+<td><code>crawler_urls_processed_total</code> rate = 0 for 5 min</td>
+<td>P1</td>
+</tr>
+<tr>
+<td>High failure rate</td>
+<td>Error rate &gt; 10% over 15 min</td>
+<td>P1</td>
+</tr>
+<tr>
+<td>Kafka lag growing</td>
+<td>Consumer lag increasing for &gt; 30 min</td>
+<td>P2</td>
+</tr>
+<tr>
+<td>Worker fleet shrinking</td>
+<td>Active pods &lt; <code>pod_count_min</code></td>
+<td>P2</td>
+</tr>
+<tr>
+<td>DB write latency</td>
+<td>p99 &gt; 5 seconds for &gt; 10 min</td>
+<td>P2</td>
+</tr>
+<tr>
+<td>Disk / S3 budget</td>
+<td>Monthly S3 cost forecast &gt; 120% of budget</td>
+<td>P3</td>
+</tr>
+<tr>
+<td>Low cache hit ratio</td>
+<td>Cache hits &lt; 20% for &gt; 1 hour</td>
+<td>P3</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="11-cost-optimization">11. Cost Optimization</h2>
+<p>A few structural choices keep costs under control at this scale:</p>
+<p><strong>Spot / preemptible instances for workers.</strong> Crawler workers are stateless —
+Kafka offsets are not committed until work is written to storage, so a spot
+instance termination just causes a re-delivery. Running workers on spot instances
+can cut compute costs by 60-70%.</p>
+<p><strong>HTML compression.</strong> Storing raw HTML gzipped on S3 at 5-15x compression ratio
+dramatically reduces storage costs. For 1 billion pages at 50KB average → ~50 TB
+uncompressed vs ~5-10 TB compressed.</p>
+<p><strong>Tiered storage.</strong> S3 lifecycle policies move raw HTML to Glacier after 90 days.
+Metadata older than 18 months is archived to Parquet files on S3 and dropped from
+PostgreSQL, keeping the active DB size bounded.</p>
+<p><strong>Batch writes to PostgreSQL.</strong> Workers accumulate results in memory and flush in
+batches of 500 records, significantly reducing DB connection overhead and write
+amplification compared to one-insert-per-crawl.</p>
+<p><strong>Selective re-crawling.</strong> Not every URL needs to be re-crawled every month.
+A freshness score (based on content change frequency) determines crawl priority.
+Frequently updated pages (news sites) crawled weekly; stable pages (product listings)
+crawled monthly; near-static pages (about pages) quarterly.</p>
+</body>
+</html>
